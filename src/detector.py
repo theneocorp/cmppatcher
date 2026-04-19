@@ -121,24 +121,10 @@ def get_patch_targets(driver_ver: str) -> dict[str, list[str]]:
         if os.path.isfile(p):
             so_targets.append(p)
 
-    nvenc_targets = []
-    for name in [f"libnvidia-encode.so.{driver_ver}"]:
-        p = os.path.join(lib_dir, name)
-        if os.path.isfile(p):
-            nvenc_targets.append(p)
-
-    fbc_targets = []
-    for name in [f"libnvidia-fbc.so.{driver_ver}"]:
-        p = os.path.join(lib_dir, name)
-        if os.path.isfile(p):
-            fbc_targets.append(p)
-
     ko_targets = sorted(glob.glob("/lib/modules/*/updates/dkms/nvidia.ko.zst"))
 
     return {
         "3d_unlock": so_targets,
-        "nvenc": nvenc_targets,
-        "fbc": fbc_targets,
         "ko_3d_unlock": ko_targets,
     }
 

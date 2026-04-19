@@ -1,6 +1,6 @@
 # cmppatcher
 
-A one-shot Linux installer that permanently patches NVIDIA mining and compute GPU drivers for all CMP series cards and legacy Pascal mining GPUs. It restores 3D acceleration, bypasses the hardware FP32 FMA throttle on the CMP 170HX, and unlocks NVENC/NVDEC stream limits.
+A one-shot Linux installer that permanently patches NVIDIA mining and compute GPU drivers for all CMP series cards and legacy Pascal mining GPUs. It restores 3D acceleration and bypasses the hardware FP32 FMA throttle on the CMP 170HX.
 
 After running `sudo bash install.sh` once, every CUDA and OpenGL/Vulkan application on the system works at full software-recoverable performance with no per-app configuration. The patches automatically reapply whenever the NVIDIA driver package is updated.
 
@@ -10,9 +10,7 @@ After running `sudo bash install.sh` once, every CUDA and OpenGL/Vulkan applicat
    NVIDIA disables 3D acceleration (OpenGL/Vulkan) on mining GPUs by excluding their PCI device IDs from driver whitelists. `cmppatcher` binary-patches `libcuda.so`, `libnvidia-glcore.so`, `libGLX_nvidia.so`, and the `nvidia.ko` kernel module to accept these GPUs.
 2. **FP32 FMA Throttle Bypass (CMP 170HX Only)**
    The CMP 170HX has hardware-fused silicon that throttles FFMA instructions by 16:1. `cmppatcher` installs a persistent SASS-level rewriting daemon that transparently replaces `FFMA` instructions with an unthrottled `FMUL+FADD` pair at CUDA module load time.
-3. **NVENC/NVDEC Session Unlock (All Supported Cards)**
-   Removes the artificial cap on concurrent video encode/decode sessions in `libnvidia-encode.so` and `libnvidia-fbc.so`.
-4. **Persistent Across Updates**
+3. **Persistent Across Updates**
    Automatically sets up package manager hooks (`apt`, `dnf`, `pacman`) to repatch the driver automatically when you update your system.
 
 ## Supported Hardware
