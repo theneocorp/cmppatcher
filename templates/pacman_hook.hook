@@ -1,0 +1,13 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = nvidia
+Target = nvidia-dkms
+Target = nvidia-utils
+Target = linux
+
+[Action]
+Description = Reapplying cmppatcher NVIDIA driver patches...
+When = PostTransaction
+Exec = /etc/cmppatcher/repatch.sh --auto
