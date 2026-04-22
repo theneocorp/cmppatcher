@@ -40,14 +40,36 @@ extern "C" {
 #define CACHE_DIR   "/etc/cmppatcher/cache"
 #define LOG_PATH    "/var/log/cmppatcher-fma.log"
 
-// Fatbinary container magic (little-endian uint32 at offset 0)
-#define FATBIN_MAGIC 0x466243B1U
+// nvcc wrapper magic (__fatBinC_Wrapper_t)
+#define FATBIN_WRAPPER_MAGIC 0x466243B1U
+// Inner fatbin payload magic (CUDA 7+): bytes 50 ED 55 BA
+#define FATBIN_PAYLOAD_MAGIC 0xBA55ED50U
 
 static std::mutex g_mutex;
+static void *g_libcuda_handle = nullptr;
 
 // Real dlsym — obtained via dlvsym to avoid bootstrap recursion.
 typedef void *(*real_dlsym_t)(void *, const char *);
 static real_dlsym_t _real_dlsym = nullptr;
+
+static void *resolve_real_symbol(const char *name) {
+    if (!_real_dlsym)
+        _real_dlsym = (real_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    if (!_real_dlsym || !name) return nullptr;
+
+    void *p = nullptr;
+    if (g_libcuda_handle) p = _real_dlsym(g_libcuda_handle, name);
+    if (!p) p = _real_dlsym(RTLD_NEXT, name);
+    if (!p) p = _real_dlsym(RTLD_DEFAULT, name);
+    if (!p) {
+        void *h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            if (!g_libcuda_handle) g_libcuda_handle = h;
+            p = _real_dlsym(h, name);
+        }
+    }
+    return p;
+}
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -176,27 +198,28 @@ static size_t elf_size_hint(const void *data) {
 // Main rewrite logic
 // ---------------------------------------------------------------------------
 
-static void dbg(const char *fmt, ...) {
-    FILE *f = fopen("/tmp/fma_hook_debug.txt", "a");
-    if (!f) return;
-    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
-    fclose(f);
-}
-
 static std::vector<uint8_t> rewrite_if_needed(const void *image) {
     if (!image) return {};
-    dbg("rewrite_if_needed: first_word=0x%08x pid=%d\n",
-        *(const uint32_t *)image, getpid());
 
-    const void  *cubin      = image;
+    const uint8_t *scan_ptr = (const uint8_t *)image;
+    const uint32_t first_word = *(const uint32_t *)scan_ptr;
+    if (first_word == FATBIN_WRAPPER_MAGIC) {
+        const uint8_t *wrapped = (const uint8_t *)*(const uint64_t *)(scan_ptr + 8);
+        if (!wrapped) return {};
+        scan_ptr = wrapped;
+    }
+
+    const void  *cubin      = scan_ptr;
     size_t       cubin_size = 0;
 
-    // Detect fatbinary container
-    const uint32_t first_word = *(const uint32_t *)image;
-    if (first_word == FATBIN_MAGIC) {
+    // Detect inner fatbinary payload
+    const uint32_t payload_magic = *(const uint32_t *)scan_ptr;
+    if (payload_magic == FATBIN_PAYLOAD_MAGIC) {
         // fatbinary header: magic(4) + version(2) + headerSize(2) + fatSize(8)
-        uint64_t fat_size = *(const uint64_t *)((const uint8_t *)image + 8);
-        const uint8_t *p   = (const uint8_t *)image;
+        uint64_t fat_size = *(const uint64_t *)(scan_ptr + 8);
+        if (fat_size < 32 || fat_size > (1ULL << 30)) return {};
+
+        const uint8_t *p   = scan_ptr;
         const uint8_t *end = p + fat_size;
         cubin = nullptr;
         for (const uint8_t *q = p; q + 16 < end; q++) {
@@ -239,6 +262,7 @@ static std::vector<uint8_t> rewrite_if_needed(const void *image) {
 typedef CUresult (*cuModuleLoadDataEx_t)(CUmodule *, const void *,
                                          unsigned int, CUjit_option *, void **);
 typedef CUresult (*cuModuleLoad_t)(CUmodule *, const char *);
+typedef CUresult (*cuModuleLoadFatBinary_t)(CUmodule *, const void *);
 
 // CUDA 12+ library loading API
 typedef CUresult (*cuLibraryLoadData_t)(
@@ -262,9 +286,15 @@ static CUresult dispatch(const void *image,
 
     static cuModuleLoadDataEx_t real_ex = nullptr;
     if (!real_ex)
-        real_ex = (cuModuleLoadDataEx_t)dlsym(RTLD_NEXT, "cuModuleLoadDataEx");
-
-    return real_ex(mod, use, n_opts, opts, vals);
+        real_ex = (cuModuleLoadDataEx_t)resolve_real_symbol("cuModuleLoadDataEx");
+    if (!real_ex) {
+        log_msg("[fma_hook] dispatch: real cuModuleLoadDataEx not found\n");
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    CUresult r = real_ex(mod, use, n_opts, opts, vals);
+    log_msg("[fma_hook] dispatch: cuModuleLoadDataEx returned %d rewritten=%d\n",
+            (int)r, rewritten.empty() ? 0 : 1);
+    return r;
 }
 
 extern "C" {
@@ -285,7 +315,7 @@ CUresult cuModuleLoad(CUmodule *mod, const char *fname) {
     FILE *f = fopen(fname, "rb");
     if (!f) {
         static cuModuleLoad_t real = nullptr;
-        if (!real) real = (cuModuleLoad_t)dlsym(RTLD_NEXT, "cuModuleLoad");
+        if (!real) real = (cuModuleLoad_t)resolve_real_symbol("cuModuleLoad");
         return real(mod, fname);
     }
     fseek(f, 0, SEEK_END);
@@ -296,6 +326,31 @@ CUresult cuModuleLoad(CUmodule *mod, const char *fname) {
     fclose(f);
     buf.resize(n);
     return dispatch(buf.data(), mod, 0, nullptr, nullptr);
+}
+
+__attribute__((visibility("default")))
+CUresult cuModuleLoadFatBinary(CUmodule *mod, const void *fatCubin) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto rewritten = rewrite_if_needed(fatCubin);
+    if (!rewritten.empty()) {
+        static cuModuleLoadDataEx_t real_ex = nullptr;
+        if (!real_ex)
+            real_ex = (cuModuleLoadDataEx_t)resolve_real_symbol("cuModuleLoadDataEx");
+        if (!real_ex) return CUDA_ERROR_NOT_SUPPORTED;
+        return real_ex(mod, rewritten.data(), 0, nullptr, nullptr);
+    }
+
+    static cuModuleLoadFatBinary_t real_fat = nullptr;
+    if (!real_fat)
+        real_fat = (cuModuleLoadFatBinary_t)resolve_real_symbol("cuModuleLoadFatBinary");
+    if (!real_fat) {
+        log_msg("[fma_hook] cuModuleLoadFatBinary: real not found\n");
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    CUresult r = real_fat(mod, fatCubin);
+    log_msg("[fma_hook] cuModuleLoadFatBinary returned %d rewritten=%d\n",
+            (int)r, rewritten.empty() ? 0 : 1);
+    return r;
 }
 
 // CUDA 12+ cuLibraryLoadData
@@ -311,10 +366,15 @@ CUresult cuLibraryLoadData(
 
     static cuLibraryLoadData_t real = nullptr;
     if (!real)
-        real = (cuLibraryLoadData_t)dlsym(RTLD_NEXT, "cuLibraryLoadData");
-    if (!real) return CUDA_ERROR_NOT_SUPPORTED;
-
-    return real(lib, use, jit_opts, jit_vals, n_jit, lib_opts, lib_vals, n_lib);
+        real = (cuLibraryLoadData_t)resolve_real_symbol("cuLibraryLoadData");
+    if (!real) {
+        log_msg("[fma_hook] cuLibraryLoadData: real not found\n");
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    CUresult r = real(lib, use, jit_opts, jit_vals, n_jit, lib_opts, lib_vals, n_lib);
+    log_msg("[fma_hook] cuLibraryLoadData returned %d rewritten=%d\n",
+            (int)r, rewritten.empty() ? 0 : 1);
+    return r;
 }
 
 // CUDA 12+ cuLibraryLoadFromFile
@@ -329,7 +389,7 @@ CUresult cuLibraryLoadFromFile(
     if (!f) {
         static cuLibraryLoadFromFile_t real = nullptr;
         if (!real)
-            real = (cuLibraryLoadFromFile_t)dlsym(RTLD_NEXT, "cuLibraryLoadFromFile");
+            real = (cuLibraryLoadFromFile_t)resolve_real_symbol("cuLibraryLoadFromFile");
         if (!real) return CUDA_ERROR_NOT_SUPPORTED;
         return real(lib, fname, jit_opts, jit_vals, n_jit, lib_opts, lib_vals, n_lib);
     }
@@ -347,7 +407,7 @@ CUresult cuLibraryLoadFromFile(
 
     static cuLibraryLoadData_t real_data = nullptr;
     if (!real_data)
-        real_data = (cuLibraryLoadData_t)dlsym(RTLD_NEXT, "cuLibraryLoadData");
+        real_data = (cuLibraryLoadData_t)resolve_real_symbol("cuLibraryLoadData");
     if (!real_data) return CUDA_ERROR_NOT_SUPPORTED;
 
     return real_data(lib, use, jit_opts, jit_vals, n_jit, lib_opts, lib_vals, n_lib);
@@ -359,15 +419,18 @@ CUresult cuLibraryLoadFromFile(
 // it and substitute our hooks for the module/library loading symbols.
 // ---------------------------------------------------------------------------
 
+extern "C" CUresult cuGetProcAddress_shim(const char *sym, void **pfn, int ver, cuuint64_t flags, ...);
+
 static void *_hook_for(const char *sym) {
     if (!sym) return nullptr;
 #define H(n) if (strcmp(sym, #n) == 0) return (void *)(n);
     H(cuModuleLoadData)
     H(cuModuleLoadDataEx)
     H(cuModuleLoad)
+    H(cuModuleLoadFatBinary)
     H(cuLibraryLoadData)
     H(cuLibraryLoadFromFile)
-    H(cuGetProcAddress)      // expands to: strcmp(...,"cuGetProcAddress") → (void*)cuGetProcAddress_v2
+    if (strcmp(sym, "cuGetProcAddress") == 0) return (void *)cuGetProcAddress_shim;
     H(cuGetProcAddress_v2)
 #undef H
     return nullptr;
@@ -377,23 +440,57 @@ static void *_hook_for(const char *sym) {
 typedef CUresult (*cuGetProcAddress_v2_t)(const char *, void **, int,
                                           cuuint64_t,
                                           CUdriverProcAddressQueryResult *);
+static cuGetProcAddress_v2_t g_real_cuGetProcAddress_v2 = nullptr;
+extern "C" CUresult cuGetProcAddress_shim(const char *sym, void **pfn, int ver, cuuint64_t flags, ...);
+
+static cuGetProcAddress_v2_t resolve_real_cuGetProcAddress_v2() {
+    if (g_real_cuGetProcAddress_v2) return g_real_cuGetProcAddress_v2;
+    if (!_real_dlsym)
+        _real_dlsym = (real_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    if (!_real_dlsym) return nullptr;
+
+    void *p = nullptr;
+    if (g_libcuda_handle)
+        p = _real_dlsym(g_libcuda_handle, "cuGetProcAddress_v2");
+    if (!p) p = _real_dlsym(RTLD_NEXT, "cuGetProcAddress_v2");
+    if (!p) p = _real_dlsym(RTLD_DEFAULT, "cuGetProcAddress_v2");
+    if (!p) {
+        void *h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            if (!g_libcuda_handle) g_libcuda_handle = h;
+            p = _real_dlsym(h, "cuGetProcAddress_v2");
+        }
+    }
+    if (p == (void *)cuGetProcAddress_v2) return nullptr;
+    g_real_cuGetProcAddress_v2 = (cuGetProcAddress_v2_t)p;
+    return g_real_cuGetProcAddress_v2;
+}
 
 __attribute__((visibility("default")))
 CUresult cuGetProcAddress_v2(const char *sym, void **pfn, int ver,
                               cuuint64_t flags,
                               CUdriverProcAddressQueryResult *status)
 {
-    dbg("cuGetProcAddress_v2 called: %s\n", sym ? sym : "(null)");
+    if (sym && pfn && strcmp(sym, "cuGetProcAddress") == 0) {
+        *pfn = (void *)cuGetProcAddress_shim;
+        if (status) *status = CU_GET_PROC_ADDRESS_SUCCESS;
+        return CUDA_SUCCESS;
+    }
     static cuGetProcAddress_v2_t real = nullptr;
     if (!real)
-        real = (cuGetProcAddress_v2_t)_real_dlsym(RTLD_NEXT, "cuGetProcAddress_v2");
+        real = resolve_real_cuGetProcAddress_v2();
     if (!real) return CUDA_ERROR_NOT_SUPPORTED;
     CUresult r = real(sym, pfn, ver, flags, status);
     if (r == CUDA_SUCCESS && pfn) {
         void *h = _hook_for(sym);
-        if (h) { dbg("cuGetProcAddress_v2: hooking %s\n", sym); *pfn = h; }
+        if (h) *pfn = h;
     }
     return r;
+}
+
+__attribute__((visibility("default")))
+CUresult cuGetProcAddress_shim(const char *sym, void **pfn, int ver, cuuint64_t flags, ...) {
+    return cuGetProcAddress_v2(sym, pfn, ver, flags, nullptr);
 }
 
 
@@ -405,13 +502,14 @@ void *dlsym(void *handle, const char *symbol) {
     // Don't intercept our own RTLD_NEXT lookups — that would recurse forever.
     if (handle == RTLD_NEXT || handle == RTLD_DEFAULT)
         return _real_dlsym(handle, symbol);
-    // Log all explicit handle-based dlsym calls for cu* symbols
-    if (symbol && symbol[0] == 'c' && symbol[1] == 'u')
-        dbg("dlsym(handle,%s)\n", symbol);
     void *result = _real_dlsym(handle, symbol);
+    if (result && symbol && strcmp(symbol, "cuGetProcAddress_v2") == 0) {
+        g_libcuda_handle = handle;
+        g_real_cuGetProcAddress_v2 = (cuGetProcAddress_v2_t)result;
+    }
     if (result && symbol) {
         void *hook = _hook_for(symbol);
-        if (hook) { dbg("dlsym: %s -> hook\n", symbol); return hook; }
+        if (hook) return hook;
     }
     return result;
 }
@@ -421,7 +519,6 @@ void fma_hook_init() {
     _real_dlsym = (real_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
     log_msg("[fma_hook] loaded into pid=%d\n", getpid());
     mkdir(CACHE_DIR, 0755);
-    dbg("fma_hook loaded pid=%d\n", getpid());
 }
 
 } // extern "C"

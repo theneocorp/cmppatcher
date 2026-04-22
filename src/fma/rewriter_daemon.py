@@ -81,11 +81,12 @@ class SassRewriter:
             if not sass:
                 return b""
 
-            # Auto-detect SM architecture
-            if "SM80" in sass or "sm_80" in sass.lower():
-                self.arch = "sm_80"
-            else:
-                self.arch = "sm_70"
+            # Auto-detect SM architecture from disassembly text.
+            # Keep sm_80 as default for GA100/CMP 170HX and avoid forcing sm_70
+            # unless the disassembly explicitly indicates a pre-sm80 target.
+            # Temporary hard-force for CMP 170HX / GA100 host: always rewrite as sm_80.
+            # The auto-detect path can mis-detect mixed nvdisasm text and choose sm_70.
+            self.arch = "sm_80"
 
             sections, pc_map, max_reg, n_replaced = self._parse_and_rewrite(sass)
             if n_replaced == 0:
