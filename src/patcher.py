@@ -66,10 +66,12 @@ FBC_PATTERNS: dict[str, tuple[bytes, bytes]] = {
 # ---------------------------------------------------------------------------
 
 def _atomic_write(path: str, data: bytes) -> None:
+    mode = os.stat(path).st_mode
     dir_ = os.path.dirname(path)
     with tempfile.NamedTemporaryFile(dir=dir_, delete=False, suffix=".tmp") as f:
         f.write(data)
         tmp = f.name
+    os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
@@ -98,38 +100,32 @@ def _patch_bytes_in_data(
 # ---------------------------------------------------------------------------
 
 def patch_3d_unlock_data(data: bytearray, device_ids: list[int]) -> list[dict]:
-    """
-    Scan the ELF data sections of `data` for each device ID stored as a
-    4-byte little-endian struct [did_lo, did_hi, 0x00, 0x00] at 4-byte
-    alignment, and replace the 16-bit ID with 0xFFFF.
-
-    Returns a list of PatchRecord dicts.
-    """
     elf = ELF64(bytes(data))
     sections = elf.get_data_sections()
     records = []
 
     for did in device_ids:
-        needle      = struct.pack("<HH", did,    0x0000)
-        replacement = struct.pack("<HH", 0xFFFF, 0x0000)
+        for padding in [0x0007]:
+            needle      = struct.pack("<HH", did,    padding)
+            replacement = struct.pack("<HH", 0xFFFF, padding)
 
-        for sec_off, sec_size in sections:
-            pos = sec_off
-            end = sec_off + sec_size
-            while True:
-                p = data.find(needle, pos, end)
-                if p < 0:
-                    break
-                if p % 4 != 0:
-                    pos = p + 2
-                    continue
-                records.append({
-                    "offset": p,
-                    "original_bytes": data[p : p + 4].hex(),
-                    "patched_bytes":  replacement.hex(),
-                })
-                data[p : p + 4] = replacement
-                pos = p + 4
+            for sec_off, sec_size in sections:
+                pos = sec_off
+                end = sec_off + sec_size
+                while True:
+                    p = data.find(needle, pos, end)
+                    if p < 0:
+                        break
+                    if p % 4 != 0:
+                        pos = p + 2
+                        continue
+                    records.append({
+                        "offset": p,
+                        "original_bytes": data[p : p + 4].hex(),
+                        "patched_bytes":  replacement.hex(),
+                    })
+                    data[p : p + 4] = replacement
+                    pos = p + 4
 
     return records
 
@@ -436,16 +432,33 @@ class Patcher:
             else:
                 print(f"  FAILED    {path} — backup not found")
                 errors += 1
-        # Remove FMA DT_NEEDED injection if present
+        # Remove FMA hook registration
         if self.manifest.get("fma_enabled"):
+            hook_path = self.manifest.get("fma_hook_path", "/etc/cmppatcher/fma_hook.so")
+            # Remove from /etc/ld.so.preload (new installs)
+            try:
+                with open("/etc/ld.so.preload", "r") as f:
+                    lines = f.readlines()
+                filtered = [l for l in lines if l.strip() != hook_path]
+                if len(filtered) != len(lines):
+                    with open("/etc/ld.so.preload", "w") as f:
+                        f.writelines(filtered)
+                    print(f"  REMOVED   {hook_path} from /etc/ld.so.preload")
+            except FileNotFoundError:
+                pass
+            # Remove old DT_NEEDED patchelf injection if still present
             libcuda = _find_libcuda(self.driver_ver)
             if libcuda:
-                subprocess.run(
-                    ["patchelf", "--remove-needed",
-                     "/etc/cmppatcher/fma_hook.so", libcuda],
-                    capture_output=True,
+                result = subprocess.run(
+                    ["patchelf", "--print-needed", libcuda],
+                    capture_output=True, text=True,
                 )
-                print(f"  REMOVED   fma_hook.so DT_NEEDED from {libcuda}")
+                if "fma_hook.so" in result.stdout:
+                    subprocess.run(
+                        ["patchelf", "--remove-needed", hook_path, libcuda],
+                        capture_output=True,
+                    )
+                    print(f"  REMOVED   fma_hook.so DT_NEEDED from {libcuda}")
         return errors
 
     def status(self) -> None:
@@ -531,13 +544,7 @@ def main() -> int:
     import glob as _glob
     lib = "/usr/lib/x86_64-linux-gnu"
     targets = {
-        "3d_unlock": [
-            p for p in [
-                f"{lib}/libcuda.so.{driver_ver}",
-                f"{lib}/libnvidia-glcore.so.{driver_ver}",
-                f"{lib}/libGLX_nvidia.so.{driver_ver}",
-            ] if os.path.isfile(p)
-        ],
+        "3d_unlock": [],
         "nvenc": [p for p in [f"{lib}/libnvidia-encode.so.{driver_ver}"] if os.path.isfile(p)],
         "fbc":   [p for p in [f"{lib}/libnvidia-fbc.so.{driver_ver}"]    if os.path.isfile(p)],
         "ko_3d_unlock": sorted(_glob.glob("/lib/modules/*/updates/dkms/nvidia.ko.zst")),

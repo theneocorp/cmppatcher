@@ -32,10 +32,15 @@ import tempfile
 # ---------------------------------------------------------------------------
 
 try:
-    sys.path.append(os.path.join(os.path.dirname(__file__), "CuAssembler"))
-    from CuAsm.CuControlCode import CuControlCode
+    import importlib.util as _ilu
+    _cc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "CuAssembler", "CuAsm", "CuControlCode.py")
+    _spec = _ilu.spec_from_file_location("CuControlCode", _cc_path)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    CuControlCode = _mod.CuControlCode
     HAS_CUASM = True
-except ImportError:
+except Exception:
     HAS_CUASM = False
 
 logging.basicConfig(
@@ -410,7 +415,7 @@ def run_server(socket_path: str) -> None:
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(socket_path)
-    os.chmod(socket_path, 0o600)
+    os.chmod(socket_path, 0o666)
     srv.listen(16)
     log.info("Listening on %s", socket_path)
 
@@ -449,6 +454,7 @@ def main() -> None:
     args = ap.parse_args()
 
     os.makedirs(args.cache_dir, exist_ok=True)
+    os.chmod(args.cache_dir, 0o1777)
     run_server(args.socket)
 
 

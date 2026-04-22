@@ -287,34 +287,36 @@ if [[ "$HAS_170HX" == "1" && "$DRY_RUN" == "0" ]]; then
             cp "$REPO_DIR/src/fma/fma_hook.cpp"       "$INSTALL_DIR/fma_hook.cpp"
             cp "$REPO_DIR/src/fma/sha256.h"            "$INSTALL_DIR/sha256.h"
             cp "$REPO_DIR/src/fma/rewriter_daemon.py"  "$INSTALL_DIR/rewriter_daemon.py"
+            cp -r "$REPO_DIR/src/fma/CuAssembler" "$INSTALL_DIR/CuAssembler"
 
             # Compile hook
             echo "  Compiling fma_hook.so ..."
             bash "$REPO_DIR/src/fma/build_fma.sh" "$INSTALL_DIR/fma_hook.so"
 
-            # Inject DT_NEEDED into libcuda.so
-            echo "  Injecting fma_hook.so into $LIBCUDA ..."
-            patchelf --add-needed "$INSTALL_DIR/fma_hook.so" "$LIBCUDA"
+            # Remove any stale patchelf DT_NEEDED injection from previous installs
+            if patchelf --print-needed "$LIBCUDA" 2>/dev/null | grep -qF "fma_hook.so"; then
+                echo "  Removing old DT_NEEDED injection from $LIBCUDA ..."
+                patchelf --remove-needed "$INSTALL_DIR/fma_hook.so" "$LIBCUDA" || true
+            fi
+
+            # Register via /etc/ld.so.preload so the hook wins symbol resolution
+            # regardless of whether CUDA is dlopen'd or linked directly.
+            echo "  Registering fma_hook.so in /etc/ld.so.preload ..."
+            touch /etc/ld.so.preload
+            if ! grep -qF "$INSTALL_DIR/fma_hook.so" /etc/ld.so.preload; then
+                echo "$INSTALL_DIR/fma_hook.so" >> /etc/ld.so.preload
+            fi
 
             # Update manifest with FMA state
             python3 - <<PYEOF
-import json, hashlib, os
+import json, os
 manifest_path = "$MANIFEST"
-libcuda        = "$LIBCUDA"
-
-def sha256_file(p):
-    h = hashlib.sha256()
-    with open(p, 'rb') as f:
-        for chunk in iter(lambda: f.read(1<<20), b''):
-            h.update(chunk)
-    return h.hexdigest()
-
 try:
     m = json.load(open(manifest_path))
 except Exception:
     m = {}
-m['fma_enabled']              = True
-m['fma_libcuda_sha256_post']  = sha256_file(libcuda)
+m['fma_enabled']      = True
+m['fma_hook_path']    = "$INSTALL_DIR/fma_hook.so"
 with open(manifest_path, 'w') as f:
     json.dump(m, f, indent=2)
 PYEOF

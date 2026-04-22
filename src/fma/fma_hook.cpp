@@ -29,6 +29,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <vector>
+#include <string>
 #include "sha256.h"
 
 extern "C" {
@@ -43,6 +44,10 @@ extern "C" {
 #define FATBIN_MAGIC 0x466243B1U
 
 static std::mutex g_mutex;
+
+// Real dlsym — obtained via dlvsym to avoid bootstrap recursion.
+typedef void *(*real_dlsym_t)(void *, const char *);
+static real_dlsym_t _real_dlsym = nullptr;
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -171,8 +176,17 @@ static size_t elf_size_hint(const void *data) {
 // Main rewrite logic
 // ---------------------------------------------------------------------------
 
+static void dbg(const char *fmt, ...) {
+    FILE *f = fopen("/tmp/fma_hook_debug.txt", "a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fclose(f);
+}
+
 static std::vector<uint8_t> rewrite_if_needed(const void *image) {
     if (!image) return {};
+    dbg("rewrite_if_needed: first_word=0x%08x pid=%d\n",
+        *(const uint32_t *)image, getpid());
 
     const void  *cubin      = image;
     size_t       cubin_size = 0;
@@ -226,6 +240,16 @@ typedef CUresult (*cuModuleLoadDataEx_t)(CUmodule *, const void *,
                                          unsigned int, CUjit_option *, void **);
 typedef CUresult (*cuModuleLoad_t)(CUmodule *, const char *);
 
+// CUDA 12+ library loading API
+typedef CUresult (*cuLibraryLoadData_t)(
+    CUlibrary *, const void *,
+    CUjit_option *, void **, unsigned int,
+    CUlibraryOption *, void **, unsigned int);
+typedef CUresult (*cuLibraryLoadFromFile_t)(
+    CUlibrary *, const char *,
+    CUjit_option *, void **, unsigned int,
+    CUlibraryOption *, void **, unsigned int);
+
 static CUresult dispatch(const void *image,
                           CUmodule *mod,
                           unsigned int n_opts,
@@ -274,10 +298,130 @@ CUresult cuModuleLoad(CUmodule *mod, const char *fname) {
     return dispatch(buf.data(), mod, 0, nullptr, nullptr);
 }
 
+// CUDA 12+ cuLibraryLoadData
+__attribute__((visibility("default")))
+CUresult cuLibraryLoadData(
+    CUlibrary *lib, const void *code,
+    CUjit_option *jit_opts, void **jit_vals, unsigned int n_jit,
+    CUlibraryOption *lib_opts, void **lib_vals, unsigned int n_lib)
+{
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto rewritten = rewrite_if_needed(code);
+    const void *use = rewritten.empty() ? code : (const void *)rewritten.data();
+
+    static cuLibraryLoadData_t real = nullptr;
+    if (!real)
+        real = (cuLibraryLoadData_t)dlsym(RTLD_NEXT, "cuLibraryLoadData");
+    if (!real) return CUDA_ERROR_NOT_SUPPORTED;
+
+    return real(lib, use, jit_opts, jit_vals, n_jit, lib_opts, lib_vals, n_lib);
+}
+
+// CUDA 12+ cuLibraryLoadFromFile
+__attribute__((visibility("default")))
+CUresult cuLibraryLoadFromFile(
+    CUlibrary *lib, const char *fname,
+    CUjit_option *jit_opts, void **jit_vals, unsigned int n_jit,
+    CUlibraryOption *lib_opts, void **lib_vals, unsigned int n_lib)
+{
+    std::lock_guard<std::mutex> lk(g_mutex);
+    FILE *f = fopen(fname, "rb");
+    if (!f) {
+        static cuLibraryLoadFromFile_t real = nullptr;
+        if (!real)
+            real = (cuLibraryLoadFromFile_t)dlsym(RTLD_NEXT, "cuLibraryLoadFromFile");
+        if (!real) return CUDA_ERROR_NOT_SUPPORTED;
+        return real(lib, fname, jit_opts, jit_vals, n_jit, lib_opts, lib_vals, n_lib);
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> buf((size_t)sz);
+    size_t n = fread(buf.data(), 1, buf.size(), f);
+    fclose(f);
+    buf.resize(n);
+
+    auto rewritten = rewrite_if_needed(buf.data());
+    const void *use = rewritten.empty() ? (const void *)buf.data()
+                                        : (const void *)rewritten.data();
+
+    static cuLibraryLoadData_t real_data = nullptr;
+    if (!real_data)
+        real_data = (cuLibraryLoadData_t)dlsym(RTLD_NEXT, "cuLibraryLoadData");
+    if (!real_data) return CUDA_ERROR_NOT_SUPPORTED;
+
+    return real_data(lib, use, jit_opts, jit_vals, n_jit, lib_opts, lib_vals, n_lib);
+}
+
+// ---------------------------------------------------------------------------
+// cuGetProcAddress hook — CUDA 12+ runtimes call this to fetch all function
+// pointers at startup, bypassing the dynamic linker entirely.  We intercept
+// it and substitute our hooks for the module/library loading symbols.
+// ---------------------------------------------------------------------------
+
+static void *_hook_for(const char *sym) {
+    if (!sym) return nullptr;
+#define H(n) if (strcmp(sym, #n) == 0) return (void *)(n);
+    H(cuModuleLoadData)
+    H(cuModuleLoadDataEx)
+    H(cuModuleLoad)
+    H(cuLibraryLoadData)
+    H(cuLibraryLoadFromFile)
+    H(cuGetProcAddress)      // expands to: strcmp(...,"cuGetProcAddress") → (void*)cuGetProcAddress_v2
+    H(cuGetProcAddress_v2)
+#undef H
+    return nullptr;
+}
+
+// 5-param version (CUDA 12.3+, underlying symbol for the cuGetProcAddress macro)
+typedef CUresult (*cuGetProcAddress_v2_t)(const char *, void **, int,
+                                          cuuint64_t,
+                                          CUdriverProcAddressQueryResult *);
+
+__attribute__((visibility("default")))
+CUresult cuGetProcAddress_v2(const char *sym, void **pfn, int ver,
+                              cuuint64_t flags,
+                              CUdriverProcAddressQueryResult *status)
+{
+    dbg("cuGetProcAddress_v2 called: %s\n", sym ? sym : "(null)");
+    static cuGetProcAddress_v2_t real = nullptr;
+    if (!real)
+        real = (cuGetProcAddress_v2_t)_real_dlsym(RTLD_NEXT, "cuGetProcAddress_v2");
+    if (!real) return CUDA_ERROR_NOT_SUPPORTED;
+    CUresult r = real(sym, pfn, ver, flags, status);
+    if (r == CUDA_SUCCESS && pfn) {
+        void *h = _hook_for(sym);
+        if (h) { dbg("cuGetProcAddress_v2: hooking %s\n", sym); *pfn = h; }
+    }
+    return r;
+}
+
+
+__attribute__((visibility("default")))
+void *dlsym(void *handle, const char *symbol) {
+    if (!_real_dlsym)
+        _real_dlsym = (real_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    if (!_real_dlsym) return nullptr;
+    // Don't intercept our own RTLD_NEXT lookups — that would recurse forever.
+    if (handle == RTLD_NEXT || handle == RTLD_DEFAULT)
+        return _real_dlsym(handle, symbol);
+    // Log all explicit handle-based dlsym calls for cu* symbols
+    if (symbol && symbol[0] == 'c' && symbol[1] == 'u')
+        dbg("dlsym(handle,%s)\n", symbol);
+    void *result = _real_dlsym(handle, symbol);
+    if (result && symbol) {
+        void *hook = _hook_for(symbol);
+        if (hook) { dbg("dlsym: %s -> hook\n", symbol); return hook; }
+    }
+    return result;
+}
+
 __attribute__((constructor))
 void fma_hook_init() {
+    _real_dlsym = (real_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
     log_msg("[fma_hook] loaded into pid=%d\n", getpid());
     mkdir(CACHE_DIR, 0755);
+    dbg("fma_hook loaded pid=%d\n", getpid());
 }
 
 } // extern "C"

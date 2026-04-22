@@ -43,7 +43,7 @@ PASCAL_IDS = {
 SUPPORTED_IDS: dict[int, str] = {**CMP_IDS, **PASCAL_IDS}
 
 # Only 0x2081 (GA100-105F) is confirmed to have the 16:1 OTP FFMA throttle.
-FMA_IDS = {0x2081}
+FMA_IDS = {0x2081, 0x20c2}
 
 
 def _read_hex(path: str) -> int | None:
@@ -105,27 +105,28 @@ def detect_driver_version() -> str | None:
 
 
 def get_patch_targets(driver_ver: str) -> dict[str, list[str]]:
-    """
-    Return lists of file paths that exist on this system, grouped by patch type.
-    Handles multiple installed kernels.
-    """
     lib_dir = "/usr/lib/x86_64-linux-gnu"
-
     so_targets = []
-    for name in [
-        f"libcuda.so.{driver_ver}",
-        f"libnvidia-glcore.so.{driver_ver}",
-        f"libGLX_nvidia.so.{driver_ver}",
-    ]:
+    nvenc_targets = []
+    fbc_targets = []
+
+    for name in [f"libnvidia-encode.so.{driver_ver}"]:
         p = os.path.join(lib_dir, name)
         if os.path.isfile(p):
-            so_targets.append(p)
+            nvenc_targets.append(p)
+
+    for name in [f"libnvidia-fbc.so.{driver_ver}"]:
+        p = os.path.join(lib_dir, name)
+        if os.path.isfile(p):
+            fbc_targets.append(p)
 
     ko_targets = sorted(glob.glob("/lib/modules/*/updates/dkms/nvidia.ko.zst"))
 
     return {
-        "3d_unlock": so_targets,
+        "3d_unlock": [],
         "ko_3d_unlock": ko_targets,
+        "nvenc": nvenc_targets,
+        "fbc": fbc_targets,
     }
 
 
