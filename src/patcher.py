@@ -325,14 +325,39 @@ class Patcher:
             self._record_patch(path, "3d_unlock", sha_pre, patched, records)
         return errors
 
+    def _fetch_keylase_pattern(self, script_url: str) -> tuple[bytes, bytes] | None:
+        import urllib.request
+        import re
+        try:
+            req = urllib.request.Request(script_url, headers={'User-Agent': 'cmppatcher/1.0'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                text = resp.read().decode('utf-8')
+            matches = re.findall(r'\["([^"]+)"\]=\'s/([^/]+)/([^/]+)/g?\'', text)
+            for ver, search_str, replace_str in matches:
+                # Sometimes versions in patch.sh have an exact match.
+                if ver == self.driver_ver:
+                    search_bytes = bytes.fromhex(search_str.replace('\\x', '').replace('\\X', ''))
+                    replace_bytes = bytes.fromhex(replace_str.replace('\\x', '').replace('\\X', ''))
+                    return search_bytes, replace_bytes
+        except Exception:
+            pass
+        return None
+
     def _run_nvenc(self) -> int:
         errors = 0
         pat = NVENC_PATTERNS.get(self.driver_ver)
+        if pat is None:
+            pat = self._fetch_keylase_pattern("https://raw.githubusercontent.com/keylase/nvidia-patch/master/patch.sh")
+            if pat:
+                self.summary.append(f"  INFO  NVENC pattern dynamically fetched from keylase/nvidia-patch for {self.driver_ver}")
+                NVENC_PATTERNS[self.driver_ver] = pat
+
         if pat is None:
             self.summary.append(
                 f"  SKIP  NVENC — no pattern for driver {self.driver_ver}"
             )
             return 0
+
         search, replace = pat
         for path in self.targets.get("nvenc", []):
             if not self._should_patch(path, "nvenc"):
@@ -355,6 +380,12 @@ class Patcher:
     def _run_fbc(self) -> int:
         errors = 0
         pat = FBC_PATTERNS.get(self.driver_ver)
+        if pat is None:
+            pat = self._fetch_keylase_pattern("https://raw.githubusercontent.com/keylase/nvidia-patch/master/patch-fbc.sh")
+            if pat:
+                self.summary.append(f"  INFO  FBC pattern dynamically fetched from keylase/nvidia-patch for {self.driver_ver}")
+                FBC_PATTERNS[self.driver_ver] = pat
+                
         if pat is None:
             self.summary.append(
                 f"  SKIP  FBC — no pattern for driver {self.driver_ver}"
