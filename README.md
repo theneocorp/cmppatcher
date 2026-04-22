@@ -28,7 +28,7 @@ After running `sudo bash install.sh` once, every CUDA and OpenGL/Vulkan applicat
 
 ```bash
 # Clone the repository
-git clone https://github.com/amoghmunikote/cmppatcher.git
+git clone https://github.com/theneocorp/cmppatcher.git
 cd cmppatcher
 
 # Run a dry-run to preview what will be done (optional)
