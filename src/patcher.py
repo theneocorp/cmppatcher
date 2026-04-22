@@ -47,6 +47,11 @@ ALL_DEVICE_IDS = CMP_IDS + PASCAL_IDS
 
 # Each entry: (search_bytes, replace_bytes)
 NVENC_PATTERNS: dict[str, tuple[bytes, bytes]] = {
+    # keylase/nvidia-patch (Linux patch.sh)
+    "595.45.04": (
+        b"\xe8\x51\x21\xfe\xff\x41\x89\xc6\x85\xc0",
+        b"\xe8\x51\x21\xfe\xff\x29\xc0\x41\x89\xc6",
+    ),
     "595.58.03": (
         b"\xe8\x51\x21\xfe\xff\x41\x89\xc6\x85\xc0",
         b"\xe8\x51\x21\xfe\xff\x29\xc0\x41\x89\xc6",
@@ -54,6 +59,11 @@ NVENC_PATTERNS: dict[str, tuple[bytes, bytes]] = {
 }
 
 FBC_PATTERNS: dict[str, tuple[bytes, bytes]] = {
+    # keylase/nvidia-patch (Linux patch-fbc.sh)
+    "595.45.04": (
+        b"\x85\xc0\x0f\x85\xd4\x00\x00\x00\x48",
+        b"\x85\xc0\x90\x90\x90\x90\x90\x90\x48",
+    ),
     "595.58.03": (
         b"\x85\xc0\x0f\x85\xd4\x00\x00\x00\x48",
         b"\x85\xc0\x90\x90\x90\x90\x90\x90\x48",
@@ -508,6 +518,36 @@ def _find_libcuda(driver_ver: str) -> str | None:
     return path if os.path.isfile(path) else None
 
 
+def _build_userspace_targets(driver_ver: str) -> dict[str, list[str]]:
+    import detector
+    gpus = detector.detect_gpus()
+    has_170hx = any(g.get("has_fma_throttle") for g in gpus)
+    
+    if has_170hx:
+        print("INFO: CMP 170HX GPU detected! Skipping NVENC patching as GA100 does not have NVENC engines.")
+    
+    lib = "/usr/lib/x86_64-linux-gnu"
+    so_names = [
+        "libcuda.so",
+        "libnvidia-glcore.so",
+        "libGLX_nvidia.so",
+    ]
+    return {
+        "3d_unlock": [
+            p for p in (f"{lib}/{name}.{driver_ver}" for name in so_names)
+            if os.path.isfile(p)
+        ],
+        "nvenc": [] if has_170hx else [
+            p for p in [f"{lib}/libnvidia-encode.so.{driver_ver}"]
+            if os.path.isfile(p)
+        ],
+        "fbc": [
+            p for p in [f"{lib}/libnvidia-fbc.so.{driver_ver}"]
+            if os.path.isfile(p)
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -542,13 +582,8 @@ def main() -> int:
 
     # Build patch targets from installed files
     import glob as _glob
-    lib = "/usr/lib/x86_64-linux-gnu"
-    targets = {
-        "3d_unlock": [],
-        "nvenc": [p for p in [f"{lib}/libnvidia-encode.so.{driver_ver}"] if os.path.isfile(p)],
-        "fbc":   [p for p in [f"{lib}/libnvidia-fbc.so.{driver_ver}"]    if os.path.isfile(p)],
-        "ko_3d_unlock": sorted(_glob.glob("/lib/modules/*/updates/dkms/nvidia.ko.zst")),
-    }
+    targets = _build_userspace_targets(driver_ver)
+    targets["ko_3d_unlock"] = sorted(_glob.glob("/lib/modules/*/updates/dkms/nvidia.ko.zst"))
 
     patcher = Patcher(
         driver_ver=driver_ver,

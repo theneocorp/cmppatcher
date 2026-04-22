@@ -104,16 +104,29 @@ def detect_driver_version() -> str | None:
     return None
 
 
-def get_patch_targets(driver_ver: str) -> dict[str, list[str]]:
+def get_patch_targets(driver_ver: str, gpus: list[dict] = None) -> dict[str, list[str]]:
+    if gpus is None:
+        gpus = detect_gpus()
+    has_170hx = any(g.get("has_fma_throttle") for g in gpus)
     lib_dir = "/usr/lib/x86_64-linux-gnu"
     so_targets = []
     nvenc_targets = []
     fbc_targets = []
 
-    for name in [f"libnvidia-encode.so.{driver_ver}"]:
+    for name in [
+        f"libcuda.so.{driver_ver}",
+        f"libnvidia-glcore.so.{driver_ver}",
+        f"libGLX_nvidia.so.{driver_ver}",
+    ]:
         p = os.path.join(lib_dir, name)
         if os.path.isfile(p):
-            nvenc_targets.append(p)
+            so_targets.append(p)
+
+    if not has_170hx:
+        for name in [f"libnvidia-encode.so.{driver_ver}"]:
+            p = os.path.join(lib_dir, name)
+            if os.path.isfile(p):
+                nvenc_targets.append(p)
 
     for name in [f"libnvidia-fbc.so.{driver_ver}"]:
         p = os.path.join(lib_dir, name)
@@ -123,7 +136,7 @@ def get_patch_targets(driver_ver: str) -> dict[str, list[str]]:
     ko_targets = sorted(glob.glob("/lib/modules/*/updates/dkms/nvidia.ko.zst"))
 
     return {
-        "3d_unlock": [],
+        "3d_unlock": so_targets,
         "ko_3d_unlock": ko_targets,
         "nvenc": nvenc_targets,
         "fbc": fbc_targets,
@@ -139,7 +152,7 @@ def main():
         "gpus": gpus,
         "driver_version": driver_ver,
         "has_170hx": has_170hx,
-        "patch_targets": get_patch_targets(driver_ver) if driver_ver else {},
+        "patch_targets": get_patch_targets(driver_ver, gpus) if driver_ver else {},
     }
     print(json.dumps(result, indent=2))
 
